@@ -13,6 +13,15 @@ import { homedir } from 'node:os';
 // 平台默认存储路径
 // ---------------------------------------------------------------------------
 
+export function resolveRealCwd(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
 export function getClaudeCodeProjectsDir(): string {
   return path.join(homedir(), '.claude', 'projects');
 }
@@ -80,6 +89,19 @@ export function encodeCwdGeneric(cwd: string): string {
 }
 
 /**
+ * CodeBuddy / WorkBuddy 的项目目录编码。
+ * 不能用上面的通用版本——它把所有非字母数字都换成 `-`，而 CodeBuddy 自己
+ * **保留空格**，实测 `.../Desktop/Code/teamai cli` 落盘为
+ * `Users-caiwenzhe-Desktop-Code-teamai cli`。通用版会算成 `...-teamai-cli`，
+ * 于是这类工作区永远匹配不上：客户端列表里看不到迁移过来的会话。
+ */
+export function encodeCwdCodeBuddy(cwd: string): string {
+  return cwd
+    .replace(/^([a-zA-Z]:)?[\\/]+/, '') // 去掉盘符与根分隔符
+    .replace(/[\\/]/g, '-');
+}
+
+/**
  * Claude Code 的 cwd 解码: 无法精确还原（`-` 可能来自 `/`、空格等），
  * 但目录名本身不需要解码为可用路径——仅用于显示。
  * 这里返回原始 encoded 字符串作为显示用 cwd。
@@ -87,6 +109,26 @@ export function encodeCwdGeneric(cwd: string): string {
 export function decodeCwdClaude(encoded: string): string {
   // 无法精确反推，返回 encoded 本身（调用方应从 session_meta 等获取真实 cwd）
   return encoded;
+}
+
+/**
+ * 最佳努力反解 Claude Code 的项目目录名 → 真实工作区路径。
+ *
+ * 部分版本的 Claude Code 会把编码后的目录名（`-Users-foo-project`）直接写进记录里的
+ * cwd 字段，导致迁移时拿不到真实工作区：目标 cwd 只能回退到「命令运行的目录」，
+ * 会话就被搬到了错误的项目下。这里按编码规则还原（前导 `-` → `/`，其余 `-` → `/`）
+ * 并用磁盘存在性校验；路径本身含 `-` 或空格时还原结果会不存在，直接放弃（返回 undefined）。
+ */
+export function bestEffortDecodeCwdClaude(encoded: string): string | undefined {
+  if (!encoded.startsWith('-')) return undefined;
+  const candidate = '/' + encoded.slice(1).replace(/-/g, '/');
+  try {
+    if (!fs.existsSync(candidate)) return undefined;
+    if (!fs.statSync(candidate).isDirectory()) return undefined;
+    return fs.realpathSync(candidate);
+  } catch {
+    return undefined;
+  }
 }
 
 /**

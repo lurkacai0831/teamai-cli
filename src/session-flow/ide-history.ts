@@ -24,7 +24,9 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import type { Session } from './ir.js';
+import type { ContentBlock, Session } from './ir.js';
+import { imagePlaceholderText } from './ir.js';
+import { isInjectedText, titleFromUserText } from './title.js';
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -40,7 +42,7 @@ interface IdeMessageFile {
 }
 
 /** IDE index.json 中的 conversation 条目。 */
-interface IdeConversation {
+export interface IdeConversation {
   id: string;
   type: 'craft' | 'plan' | 'team-member';
   name: string;
@@ -54,6 +56,11 @@ export interface IdeSyncResult {
   synced: number;
   /** 写入的消息条数（按 IDE 计，tool-result 会拆成独立消息） */
   messageCount: number;
+  /**
+   * 实际写入的 conversation id（32 位 hex）。
+   * 非 UUID 的 sessionId 会被哈希，调用方不能拿源 sessionId 直接当 IDE id。
+   */
+  convId?: string;
   /** 未同步时的原因（synced===0 时有值） */
   skipped?: string;
 }
@@ -79,16 +86,33 @@ function hex32(): string {
  * 返回 null 让调用方跳过——宁可不同步，也不能用错误 hash 写进无关目录。
  */
 export function hashWorkspace(cwd: string): string | null {
-  if (!cwd || !cwd.startsWith('/')) return null;
-  const normalized = path.resolve(cwd).replace(/\/+$/, '');
+  // POSIX 绝对路径，或 Windows 盘符绝对路径（C:\ 或 C:/）
+  if (!cwd || !(cwd.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(cwd))) return null;
+  let normalized = path.resolve(cwd).replace(/\/+$/, '');
+  // macOS 上 /tmp 是 /private/tmp 的符号链接，VSCode 传给 IDE 的是解析后的真实路径。
+  // 不做 realpath 的话，「用 /tmp 写入、在 /private/tmp 列出」会算出两个不同的
+  // 工作区 hash：写入成功却列不出来，用户以为迁移丢了。
+  try {
+    normalized = fs.realpathSync(normalized).replace(/\/+$/, '');
+  } catch {
+    // 目录不存在（createIfMissing 场景）时保留原路径
+  }
   return crypto.createHash('md5').update(normalized).digest('hex');
 }
 
 /**
  * conversation id：IDE 用 32 位 hex（无横线）。
- * UUID v4 去横线即可；非 UUID 则回退为 md5(sessionId)。
+ *
+ * 三种输入都要能映射回**同一个** id，否则读与删会各算各的：
+ * - 32 位 hex（IDE 原生 / codebuddy-ide 读出来的 id）→ 原样复用
+ * - 带横线的 UUID（其他平台的 sessionId）→ 去横线
+ * - 其余形态 → md5 兜底
+ *
+ * 漏掉第一种会让 IDE 侧会话 id 被二次哈希：写入时生成一个新 id，
+ * 回滚时再哈希一次又不同，目录删不掉 —— 报告成功却留下永久残留。
  */
 function toIdeConvId(sessionId: string): string {
+  if (/^[0-9a-f]{32}$/i.test(sessionId)) return sessionId.toLowerCase();
   const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   if (uuidRe.test(sessionId)) return sessionId.replace(/-/g, '').toLowerCase();
   return crypto.createHash('md5').update(sessionId).digest('hex');
@@ -118,6 +142,42 @@ function getUserDataBase(): string | null {
 }
 
 /**
+ * 列出所有 IDE 实例的 history 根目录。
+ *
+ * 磁盘上有两种布局，都真实存在：
+ *   - <base>/<extId>/CodeBuddyIDE/<instId>/history   常规实例（instId 通常与 extId 同名）
+ *   - <base>/<extId>/CodeBuddyIDE/history            default 实例，少一层 instId
+ *
+ * 只认第一种会让 default 实例下的会话整体消失（既读不到也写不进），
+ * 故两种都收集。
+ */
+export function listIdeHistoryRoots(): string[] {
+  const base = getUserDataBase();
+  if (!base || !fs.existsSync(base)) return [];
+
+  const out: string[] = [];
+  try {
+    for (const extId of fs.readdirSync(base)) {
+      const ideRoot = path.join(base, extId, 'CodeBuddyIDE');
+      if (!fs.existsSync(ideRoot)) continue;
+
+      const direct = path.join(ideRoot, 'history');
+      if (fs.existsSync(direct)) out.push(direct);
+
+      for (const instId of fs.readdirSync(ideRoot)) {
+        if (instId === 'history') continue;
+        const historyRoot = path.join(ideRoot, instId, 'history');
+        if (fs.existsSync(historyRoot)) out.push(historyRoot);
+      }
+    }
+  } catch {
+    return out;
+  }
+
+  return out;
+}
+
+/**
  * 找出所有 IDE 实例下该 cwd 对应的 history 目录。
  *
  * 通常只有 1 个（单用户单实例）。多实例时全部返回，逐个写入。
@@ -125,28 +185,14 @@ function getUserDataBase(): string | null {
  * 仍返回待创建路径，使其下次打开即可见。
  */
 export function findIdeHistoryDirs(cwd: string, createIfMissing = false): string[] {
-  const base = getUserDataBase();
-  if (!base || !fs.existsSync(base)) return [];
-
   const hash = hashWorkspace(cwd);
   if (!hash) return []; // cwd 不是真实绝对路径，放弃同步
 
   const out: string[] = [];
-  try {
-    for (const extId of fs.readdirSync(base)) {
-      const ideRoot = path.join(base, extId, 'CodeBuddyIDE');
-      if (!fs.existsSync(ideRoot)) continue;
-      for (const instId of fs.readdirSync(ideRoot)) {
-        const historyRoot = path.join(ideRoot, instId, 'history');
-        if (!fs.existsSync(historyRoot)) continue;
-        const target = path.join(historyRoot, hash);
-        if (fs.existsSync(target) || createIfMissing) out.push(target);
-      }
-    }
-  } catch {
-    return [];
+  for (const historyRoot of listIdeHistoryRoots()) {
+    const target = path.join(historyRoot, hash);
+    if (fs.existsSync(target) || createIfMissing) out.push(target);
   }
-
   return out;
 }
 
@@ -238,8 +284,20 @@ function resolveTimestamps(session: Session): string[] {
   return ts.map((t) => new Date(Number.isFinite(t) ? t : base).toISOString());
 }
 
-function irToIdeMessages(session: Session): IdeMessageFile[] {
+/** 待落盘的会话资源（图片）。data 优先，其次从 sourcePath 复制。 */
+export interface IdeAsset {
+  /** assets/ 下的文件名（沿用原生命名 image.<hash8>.<ext> 风格） */
+  name: string;
+  /** 源端文件绝对路径（有它优先复制，避免 base64 往返） */
+  sourcePath?: string;
+  /** base64 内容（filePath 不可读时的兜底） */
+  data?: string;
+}
+
+function irToIdeMessages(session: Session): { messages: IdeMessageFile[]; assets: IdeAsset[] } {
   const out: IdeMessageFile[] = [];
+  const assets: IdeAsset[] = [];
+  const usedNames = new Set<string>();
   const model = pickModel(session);
   const timestamps = resolveTimestamps(session);
 
@@ -251,6 +309,24 @@ function irToIdeMessages(session: Session): IdeMessageFile[] {
     }
   }
 
+  // IR 图片块 → assets/<name> + codebuddy-asset:// 引用（与原生存储一致）
+  const assetRef = (b: Extract<ContentBlock, { type: 'image' }>): string | null => {
+    const base = b.label || path.basename(b.filePath ?? 'image.png') || 'image.png';
+    const ext = path.extname(base) || `.${(b.mimeType.split('/')[1] ?? 'png').replace('jpeg', 'jpg')}`;
+    const stem = base.slice(0, base.length - ext.length) || 'image';
+    let name = `${stem}${ext}`;
+    for (let i = 1; usedNames.has(name); i++) name = `${stem}-${i}${ext}`;
+    usedNames.add(name);
+    if (b.filePath && fs.existsSync(b.filePath)) {
+      assets.push({ name, sourcePath: b.filePath });
+    } else if (b.data) {
+      assets.push({ name, data: b.data });
+    } else {
+      return null; // 无内容可用：调用方降级为占位文本
+    }
+    return `codebuddy-asset://assets/${name}`;
+  };
+
   session.messages.forEach((msg, msgIdx) => {
     const ts = timestamps[msgIdx];
     const msgModel = msg.metadata?.model ?? model;
@@ -261,13 +337,20 @@ function irToIdeMessages(session: Session): IdeMessageFile[] {
       isHelperMessage: false,
     });
 
-    // 1) thinking + text + tool_call → 一条
+    // 1) thinking + text + image + tool_call → 一条
     const content: Record<string, unknown>[] = [];
     for (const b of msg.content) {
       if (b.type === 'thinking') {
         content.push({ type: 'reasoning', text: b.text });
       } else if (b.type === 'text') {
         content.push({ type: 'text', text: b.text });
+      } else if (b.type === 'image') {
+        const ref = assetRef(b);
+        if (ref) {
+          content.push({ type: 'image', image: ref });
+        } else {
+          content.push({ type: 'text', text: imagePlaceholderText(b) });
+        }
       } else if (b.type === 'tool_call') {
         content.push({
           type: 'tool-call',
@@ -332,7 +415,7 @@ function irToIdeMessages(session: Session): IdeMessageFile[] {
     }
   });
 
-  return out;
+  return { messages: out, assets };
 }
 
 // ---------------------------------------------------------------------------
@@ -385,6 +468,9 @@ function upsertConversation(historyDir: string, conv: IdeConversation): void {
   if (i >= 0) convs[i] = conv;
   else convs.push(conv);
   data.conversations = convs;
+  // 原生 index.json 顶层必有 current（指向当前会话）。新建工作区时不会天然存在，
+  // 缺失可能让 IDE 打开该工作区时没有选中项 → 补上刚写入的这条。
+  if (!data.current) data.current = conv.id;
   writeIndex(historyDir, data);
 }
 
@@ -413,21 +499,31 @@ function removeDirRecursive(dir: string): void {
  * 源平台注入的系统前缀。首条「用户消息」常常是这类包装文本，
  * 直接当标题会把提示词原文泄漏到 IDE 侧边栏历史列表里。
  */
-const SYSTEM_INJECTED_TITLE = /^\s*<(local-command-caveat|system-reminder|system|command-name|command-message|command-args|timestamp)\b/i;
+const SYSTEM_INJECTED_TITLE = /^\s*<(local-command-caveat|local-command-stdout|system-reminder|system|command-name|command-message|command-args|command-contents|timestamp)\b/i;
 
 /**
  * 会话标题：清洗系统注入文本，拿不到有效标题时退回首条真实用户文本。
  */
+/** 源适配器给不出标题时的占位名（如 "Session 2bf4d3be"）——不能拿它当会话标题。 */
+const PLACEHOLDER_TITLE = /^session\s+[0-9a-f]{8}$/i;
+
 function cleanTitle(session: Session, convId: string): string {
   const raw = (session.title ?? '').replace(/\s+/g, ' ').trim();
-  if (raw && !SYSTEM_INJECTED_TITLE.test(raw)) return raw.slice(0, 100);
+  if (raw && !PLACEHOLDER_TITLE.test(raw) && !SYSTEM_INJECTED_TITLE.test(raw)) return raw.slice(0, 100);
 
   for (const m of session.messages) {
     if (m.role !== 'user') continue;
     for (const b of m.content) {
       if (b.type !== 'text') continue;
+      // 源平台的首条用户消息常被 <user_info>/<rules>/<additional_data> 与附件路径包裹，
+      // 直接用原文当标题会整段被判定为注入文本 → 退回 "Session xxxxxxxx"。
+      // 先走清洗（解 <user_query> 包裹 + 剥元信息 + 去附件路径）再取标题。
+      const cleaned = titleFromUserText(b.text);
+      if (cleaned) return cleaned.slice(0, 100);
       const t = b.text.replace(/\s+/g, ' ').trim();
-      if (t && !SYSTEM_INJECTED_TITLE.test(t)) return t.slice(0, 100);
+      // isInjectedText 是 title.ts 维护的完整注入标签头清单（与 META_BLOCK_RE 同源演进），
+      // SYSTEM_INJECTED_TITLE 只保留作双保险——单一来源，避免再加标签时两边漏同步。
+      if (t && !isInjectedText(t) && !SYSTEM_INJECTED_TITLE.test(t)) return t.slice(0, 100);
     }
   }
   return `Session ${convId.slice(0, 8)}`;
@@ -488,12 +584,12 @@ export function writeIdeSession(session: Session, cwd: string): IdeSyncResult {
     return {
       synced: 0,
       messageCount: 0,
-      skipped: 'CodeBuddy IDE 存储未找到（未安装或未初始化），仅写入 CLI 路径',
+      skipped: 'CodeBuddy IDE storage not found (not installed or initialized); only the CLI path was written',
     };
   }
 
   const convId = toIdeConvId(session.sessionId);
-  const messages = irToIdeMessages(session);
+  const { messages, assets } = irToIdeMessages(session);
   const model = pickModel(session);
   const requests = buildIdeRequests(session, messages);
 
@@ -502,7 +598,10 @@ export function writeIdeSession(session: Session, cwd: string): IdeSyncResult {
     type: 'craft',
     name: cleanTitle(session, convId),
     createdAt: session.createdAt,
-    lastMessageAt: session.updatedAt,
+    // lastMessageAt 用迁移时刻而非源会话时间：IDE 列表按最近活动排序分组，
+    // 保留源时间会把迁移会话埋进「N 天前」分组，用户迁完在顶部找不到。
+    // 源时间轴保留在 createdAt（列表详情）与消息时间戳（打开会话后）里。
+    lastMessageAt: new Date().toISOString(),
     ...(model ? { modelMap: { ask: model, craft: model, plan: model } } : {}),
   };
 
@@ -521,6 +620,52 @@ export function writeIdeSession(session: Session, cwd: string): IdeSyncResult {
         }
       }
       fs.mkdirSync(msgDir, { recursive: true });
+
+      // 落盘图片资源：与原生存储一致放 <convDir>/assets/，消息里用
+      // codebuddy-asset://assets/<name> 相对引用。某个资源失败只降级该图片
+      // （替换成占位文本），不阻断整个会话写入。
+      if (assets.length > 0) {
+        const assetsDir = path.join(convDir, 'assets');
+        try {
+          fs.mkdirSync(assetsDir, { recursive: true });
+        } catch {
+          // 建不了目录时下方逐个写入会失败并走占位降级
+        }
+        for (const asset of assets) {
+          let ok = false;
+          try {
+            const dest = path.join(assetsDir, asset.name);
+            if (asset.sourcePath && fs.existsSync(asset.sourcePath)) {
+              fs.copyFileSync(asset.sourcePath, dest);
+              ok = true;
+            } else if (asset.data) {
+              fs.writeFileSync(dest, Buffer.from(asset.data, 'base64'));
+              ok = true;
+            }
+          } catch {
+            ok = false;
+          }
+          if (!ok) {
+            const ref = `codebuddy-asset://assets/${asset.name}`;
+            for (const m of messages) {
+              let body: { role?: string; content?: Array<Record<string, unknown>> };
+              try {
+                body = JSON.parse(m.message);
+              } catch {
+                continue;
+              }
+              if (!Array.isArray(body.content)) continue;
+              const idx = body.content.findIndex(
+                (c) => c.type === 'image' && c.image === ref,
+              );
+              if (idx >= 0) {
+                body.content[idx] = { type: 'text', text: `[image: ${asset.name} (asset write failed)]` };
+                m.message = JSON.stringify(body);
+              }
+            }
+          }
+        }
+      }
 
       // 写每条消息，同时收集顺序索引。
       // conversation 级 index.json 是**消息顺序索引**——IDE 靠它决定显示顺序，
@@ -558,7 +703,7 @@ export function writeIdeSession(session: Session, cwd: string): IdeSyncResult {
   return {
     synced,
     messageCount: messages.length,
-    ...(synced === 0 ? { skipped: 'IDE history 目录写入失败' } : {}),
+    ...(synced > 0 ? { convId } : { skipped: 'failed to write IDE history directories' }),
   };
 }
 
@@ -569,27 +714,19 @@ export function writeIdeSession(session: Session, cwd: string): IdeSyncResult {
  * 无法还原真实路径），算不出 workspace hash。而 convId 是全局唯一的，
  * 故直接全局搜索，不依赖 cwd。
  */
-function findIdeConversationDirs(convId: string): Array<{ historyDir: string; convDir: string }> {
-  const base = getUserDataBase();
-  if (!base || !fs.existsSync(base)) return [];
-
+export function findIdeConversationDirs(convId: string): Array<{ historyDir: string; convDir: string }> {
   const out: Array<{ historyDir: string; convDir: string }> = [];
   try {
-    for (const extId of fs.readdirSync(base)) {
-      const ideRoot = path.join(base, extId, 'CodeBuddyIDE');
-      if (!fs.existsSync(ideRoot)) continue;
-      for (const instId of fs.readdirSync(ideRoot)) {
-        const historyRoot = path.join(ideRoot, instId, 'history');
-        if (!fs.existsSync(historyRoot)) continue;
-        for (const wsHash of fs.readdirSync(historyRoot)) {
-          const historyDir = path.join(historyRoot, wsHash);
-          const convDir = path.join(historyDir, convId);
-          if (fs.existsSync(convDir)) out.push({ historyDir, convDir });
-        }
+    for (const historyRoot of listIdeHistoryRoots()) {
+      for (const wsHash of fs.readdirSync(historyRoot)) {
+        const historyDir = path.join(historyRoot, wsHash);
+        if (!fs.statSync(historyDir).isDirectory()) continue;
+        const convDir = path.join(historyDir, convId);
+        if (fs.existsSync(convDir)) out.push({ historyDir, convDir });
       }
     }
   } catch {
-    return [];
+    return out;
   }
   return out;
 }
@@ -638,4 +775,179 @@ export function deleteIdeSession(sessionId: string, cwd?: string): number {
   }
 
   return cleaned;
+}
+
+// ---------------------------------------------------------------------------
+// IDE → IR 读取（供 codebuddy-ide 适配器使用）
+// ---------------------------------------------------------------------------
+
+/** 解析后的单条 IDE 消息（content 为 IDE 原生 block 数组）。 */
+export interface IdeMessageParsed {
+  id: string;
+  role: 'user' | 'assistant' | 'tool';
+  createdAt?: string;
+  content: Array<Record<string, unknown>>;
+  model?: string;
+}
+
+/** 一个 IDE 会话条目，带定位信息，适配器可直接命中目录而不必二次搜索。 */
+export interface IdeConversationEntry {
+  id: string;
+  name: string;
+  type: string;
+  createdAt: string;
+  lastMessageAt: string;
+  /** history/<workspace-hash> */
+  historyDir: string;
+  /** md5(cwd)，不可逆——cwd 只能由调用方传入才能还原 */
+  workspaceHash: string;
+  convDir: string;
+}
+
+/**
+ * 读取某个工作区（history/<hash>）下 index.json 里的会话元数据。
+ *
+ * 注意入参是**工作区目录**而非 history 根——两者的子目录语义完全不同
+ * （工作区下是会话目录，history 根下是工作区目录），传错会得到空列表。
+ */
+export function readIdeConversations(historyDir: string): IdeConversation[] {
+  return (readIndex(historyDir).conversations ?? []).filter((c) => Boolean(c?.id));
+}
+
+/**
+ * 列出 IDE 侧的全部会话。
+ *
+ * 不传 historyDirs 时遍历所有 IDE 实例；传入则只遍历指定工作区（按 md5(cwd) 定位）。
+ */
+export function listIdeConversations(historyDirs?: string[]): IdeConversationEntry[] {
+  const roots = historyDirs ?? listIdeHistoryRoots();
+  const out: IdeConversationEntry[] = [];
+
+  for (const historyRoot of roots) {
+    let wsHashes: string[] = [];
+    try {
+      wsHashes = fs.readdirSync(historyRoot);
+    } catch {
+      continue;
+    }
+    for (const wsHash of wsHashes) {
+      const historyDir = path.join(historyRoot, wsHash);
+      try {
+        if (!fs.statSync(historyDir).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      for (const c of readIndex(historyDir).conversations as IdeConversation[]) {
+        if (!c?.id) continue;
+        out.push({
+          id: c.id,
+          name: c.name ?? '',
+          type: c.type ?? 'craft',
+          createdAt: c.createdAt ?? '',
+          lastMessageAt: c.lastMessageAt ?? c.createdAt ?? '',
+          historyDir,
+          workspaceHash: wsHash,
+          convDir: path.join(historyDir, c.id),
+        });
+      }
+    }
+  }
+
+  return out;
+}
+
+function parseIdeMessageFile(file: string): IdeMessageParsed | null {
+  let raw: IdeMessageFile;
+  try {
+    raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as IdeMessageFile;
+  } catch {
+    return null;
+  }
+
+  // message 是 stringified JSON；损坏（IDE 正在写的半截文件）时整条跳过，
+  // 半截 JSON 无法降级为文本——拼回去只会得到无法阅读的乱码。
+  let body: { role?: string; content?: unknown };
+  try {
+    body = JSON.parse(raw.message) as { role?: string; content?: unknown };
+  } catch {
+    return null;
+  }
+
+  const content = Array.isArray(body.content) ? (body.content as Array<Record<string, unknown>>) : [];
+
+  let model: string | undefined;
+  try {
+    const extra = JSON.parse(raw.extra ?? '{}') as { modelName?: string };
+    if (extra?.modelName) model = String(extra.modelName).replace(/^custom-local:/, '');
+  } catch {
+    // extra 缺失不影响消息本身
+  }
+
+  const role = (raw.role ?? body.role ?? 'user') as IdeMessageParsed['role'];
+
+  return {
+    id: raw.id ?? path.basename(file, '.json'),
+    role,
+    createdAt: raw.createdAt,
+    content,
+    ...(model ? { model } : {}),
+  };
+}
+
+/**
+ * 按会话目录读取消息，保持 IDE 侧显示顺序。
+ *
+ * 顺序来源是 convDir/index.json 的 messages 数组——IDE 靠它决定展示顺序，
+ * 文件名的字典序与真实顺序无关（消息 id 是内容哈希/UUID）。
+ * index 缺失时才退回文件名排序，并在末尾补上 index 未覆盖的孤儿文件。
+ */
+export function readIdeConversation(convDir: string, limit?: number): IdeMessageParsed[] {
+  const msgDir = path.join(convDir, 'messages');
+  if (!fs.existsSync(msgDir)) return [];
+
+  let order: string[] = [];
+  try {
+    const idx = JSON.parse(fs.readFileSync(path.join(convDir, 'index.json'), 'utf-8')) as {
+      messages?: Array<{ id?: string }>;
+    };
+    if (Array.isArray(idx.messages)) {
+      order = idx.messages.map((m) => String(m?.id ?? '')).filter(Boolean);
+    }
+  } catch {
+    order = [];
+  }
+
+  let files: string[] = [];
+  try {
+    files = fs.readdirSync(msgDir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return [];
+  }
+
+  if (order.length === 0) {
+    files.sort();
+    order = files.map((f) => f.replace(/\.json$/, ''));
+  }
+
+  const messages: IdeMessageParsed[] = [];
+  const seen = new Set<string>();
+  const reached = (): boolean => limit !== undefined && messages.length >= limit;
+
+  for (const id of order) {
+    if (reached()) break;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const parsed = parseIdeMessageFile(path.join(msgDir, `${id}.json`));
+    if (parsed) messages.push(parsed);
+  }
+  for (const f of files) {
+    if (reached()) break;
+    const id = f.replace(/\.json$/, '');
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const parsed = parseIdeMessageFile(path.join(msgDir, f));
+    if (parsed) messages.push(parsed);
+  }
+
+  return messages;
 }

@@ -23,9 +23,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { AgentAdapter, type SessionMeta } from './base.js';
 import type { Session, Message, ContentBlock, TextBlock, ThinkingBlock, ToolCallBlock, ToolResultBlock } from '../ir.js';
+import { deriveTargetSessionId } from '../ids.js';
+import { imagePlaceholderText } from '../ir.js';
 import {
   getClaudeCodeProjectsDir,
   encodeCwdClaude,
+  bestEffortDecodeCwdClaude,
   decodeCwdClaude,
   readJsonl,
   readJsonlHead,
@@ -35,6 +38,13 @@ import {
   scanFiles,
   removeDirRecursive,
 } from '../fs.js';
+import {
+  cleanTitleText,
+  fallbackTitle,
+  isInjectedText,
+  titleFromCandidates,
+  titleFromUserText,
+} from '../title.js';
 
 // ---------------------------------------------------------------------------
 // 工具名归一化映射
@@ -200,9 +210,31 @@ function parseCcContentBlocks(content: unknown): ContentBlock[] {
         content: rawContent as string,
         isError: Boolean(b.is_error ?? false),
       });
+    } else if (btype === 'image') {
+      // 用户贴进输入框的截图：Anthropic 格式是
+      // {type:'image', source:{type:'base64', media_type, data}}（也可能 {type:'url', url}）。
+      // 不解析的话图片既不进 IR 也不写进目标，保真度还照样算 100%（静默漏报）。
+      const src = b.source as Record<string, unknown> | undefined;
+      const data = typeof src?.data === 'string' ? src.data : undefined;
+      const url = typeof b.url === 'string' ? b.url : (typeof src?.url === 'string' ? src.url : undefined);
+      if (!data && !url) continue;
+      blocks.push({
+        type: 'image',
+        mimeType: String(src?.media_type ?? 'image/png'),
+        // base64 直接带；纯 URL 形态只留指针（写入侧按目标能力降级）
+        ...(data ? { data } : {}),
+        ...(url ? { filePath: url } : {}),
+        label: guessImageLabel(String(src?.media_type ?? 'image/png')),
+      });
     }
   }
   return blocks;
+}
+
+/** 内联图片没有文件名，按 mime 给一个可读的占位名（写回/降级占位符用）。 */
+function guessImageLabel(mimeType: string): string {
+  const ext = mimeType.split('/')[1]?.replace('jpeg', 'jpg') ?? 'png';
+  return `image.${ext}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +265,23 @@ function irBlockToCc(block: ContentBlock): Record<string, unknown> | null {
         content: block.content,
         is_error: block.isError,
       };
+    case 'image': {
+      // CC 原生支持用户消息里的 base64 图片块。data 缺失（源文件读不到）时
+      // 从 filePath 现读；再不行降级占位文本，绝不静默丢块。
+      let data = block.data;
+      if (!data && block.filePath) {
+        try {
+          data = fs.readFileSync(block.filePath).toString('base64');
+        } catch {
+          data = undefined;
+        }
+      }
+      if (!data) return { type: 'text', text: imagePlaceholderText(block) };
+      return {
+        type: 'image',
+        source: { type: 'base64', media_type: block.mimeType, data },
+      };
+    }
   }
 }
 
@@ -298,7 +347,7 @@ export class ClaudeCodeAdapter extends AgentAdapter {
 
     for (const projDir of projDirs) {
       if (!dirExists(projDir)) continue;
-      const cwd = decodeCwdClaude(path.basename(projDir));
+      const cwd = bestEffortDecodeCwdClaude(path.basename(projDir)) ?? decodeCwdClaude(path.basename(projDir));
       for (const jsonlFile of fs.readdirSync(projDir).filter((f) => f.endsWith('.jsonl')).sort()) {
         const fullPath = path.join(projDir, jsonlFile);
         const meta = this.extractMeta(fullPath, cwd);
@@ -314,10 +363,13 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     let createdAt: string | undefined;
     let updatedAt: string | undefined;
     let messageCount = 0;
-    let firstUserText = '';
+    const userTextCandidates: string[] = [];
+    let summaryTitle = '';
 
     try {
-      for (const record of readJsonlHead(jsonlPath, 50)) {
+      // 50 行常常全是注入块（system-reminder / 命令记录 / snapshot），预算不够会让
+      // 有真实提问的会话也 fallback 成 "Session <id>"；200 行与 codex/workbuddy 对齐。
+      for (const record of readJsonlHead(jsonlPath, 200)) {
         const rtype = record.type as string;
         const ts = parseCcTimestamp(record.timestamp as string);
 
@@ -326,20 +378,25 @@ export class ClaudeCodeAdapter extends AgentAdapter {
           updatedAt = ts;
         }
 
+        if (rtype === 'summary' && !summaryTitle) {
+          summaryTitle = String(record.summary ?? '');
+        }
+
         if (rtype === 'user' || rtype === 'assistant') {
           messageCount++;
-          if (rtype === 'user' && !firstUserText) {
+          if (rtype === 'user' && userTextCandidates.length < 5) {
             const msg = record.message as Record<string, unknown> | undefined;
             const content = msg?.content;
             if (typeof content === 'string') {
-              firstUserText = content;
+              userTextCandidates.push(content);
             } else if (Array.isArray(content)) {
+              const parts: string[] = [];
               for (const block of content) {
                 if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'text') {
-                  firstUserText = String((block as Record<string, unknown>).text ?? '');
-                  break;
+                  parts.push(String((block as Record<string, unknown>).text ?? ''));
                 }
               }
+              if (parts.length) userTextCandidates.push(parts.join(' '));
             }
           }
         }
@@ -351,7 +408,12 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     if (!createdAt) createdAt = new Date().toISOString();
     if (!updatedAt) updatedAt = createdAt;
 
-    title = firstUserText ? firstUserText.slice(0, 50) : `Session ${sessionId.slice(0, 8)}`;
+    // 标题：summary 行（CC /resume 用的就是它）> 用户文本解包 > id 兜底。
+    // 不再按「整条是否注入」跳过——<command-name> 等注入头后跟真实提问的混合消息
+    // 会被整条丢掉；titleFromUserText 能解 <user_query> 包裹并剥元信息。
+    title = summaryTitle ? cleanTitleText(summaryTitle) : '';
+    if (!title) title = titleFromCandidates(userTextCandidates);
+    if (!title) title = fallbackTitle(sessionId);
 
     let sizeBytes = 0;
     try {
@@ -376,37 +438,58 @@ export class ClaudeCodeAdapter extends AgentAdapter {
   async readSession(sessionId: string, projectPath?: string): Promise<Session> {
     const jsonlPath = this.findSessionFile(sessionId, projectPath);
     if (!jsonlPath) {
-      throw new Error(`Claude Code 会话文件未找到: session_id=${sessionId}, project_path=${projectPath ?? 'undefined'}`);
+      throw new Error(`Claude Code session file not found: session_id=${sessionId}, project_path=${projectPath ?? 'undefined'}`);
     }
 
-    const cwd = decodeCwdClaude(path.basename(path.dirname(jsonlPath)));
+    const cwd =
+      bestEffortDecodeCwdClaude(path.basename(path.dirname(jsonlPath))) ??
+      decodeCwdClaude(path.basename(path.dirname(jsonlPath)));
 
     // 收集所有消息记录
     const rawRecords: Record<string, unknown>[] = [];
+    let nativeCwd: string | undefined;
+    let summaryTitle: string | undefined;
     for (const record of readJsonl(jsonlPath)) {
       const rtype = record.type as string;
+      if (rtype === 'summary') {
+        // writeSession 落盘的标题行（CC /resume 也以它为准）。读取侧不认的话，
+        // roundtrip 后标题会漂移成首条用户文本（可能是注入清洗后的残句）。
+        const t = String(record.summary ?? '');
+        if (t) summaryTitle = t; // 取最后一条（writeSession 追加在文件末尾）
+        continue;
+      }
       if (SKIP_TYPES.has(rtype)) continue;
       if (rtype !== 'user' && rtype !== 'assistant') continue;
+      // 每条消息记录都带真实 cwd（绝对路径）。目录名解码是有损的
+      // （`-` 可能来自 `/` 或空格），归档键（repoIdentity）必须优先用
+      // 记录里的原生 cwd（设计文档 Key invariant）；恢复失败退回解码目录名。
+      if (nativeCwd === undefined && typeof record.cwd === 'string' && path.isAbsolute(record.cwd)) {
+        nativeCwd = record.cwd;
+      }
       rawRecords.push(record);
     }
+    // 记录里的 cwd 有时是编码目录名（`-Users-foo-project`），不是真实路径：
+    // 反解成真实工作区，迁移才能「保持源会话的工作区」而不是回退到当前目录。
+    const sessionCwd = nativeCwd ?? bestEffortDecodeCwdClaude(cwd) ?? cwd;
 
     // DAG 拍平
     const messages = this.flattenDag(rawRecords);
 
-    // 提取标题
-    let title = '';
-    for (const msg of messages) {
-      if (msg.role === 'user') {
+    // 提取标题：优先 summary 标题行（写入侧落盘、CC /resume 亦采用），
+    // 其次用户文本解包（注入头 + 真实提问的混合消息也能解），最后退回 id 前缀。
+    let title = summaryTitle ? cleanTitleText(summaryTitle) : '';
+    if (!title) {
+      const candidates: string[] = [];
+      for (const msg of messages) {
+        if (msg.role !== 'user') continue;
         for (const block of msg.content) {
-          if (block.type === 'text' && block.text) {
-            title = block.text.slice(0, 50);
-            break;
-          }
+          if (block.type === 'text' && block.text) candidates.push(block.text);
         }
-        if (title) break;
+        if (candidates.length >= 5) break;
       }
+      title = titleFromCandidates(candidates);
     }
-    if (!title) title = `Session ${sessionId.slice(0, 8)}`;
+    if (!title) title = fallbackTitle(sessionId);
 
     // 时间戳
     let createdAt: string | undefined;
@@ -437,7 +520,7 @@ export class ClaudeCodeAdapter extends AgentAdapter {
     return {
       sessionId,
       title,
-      cwd,
+      cwd: sessionCwd,
       platform: this.platform,
       createdAt,
       updatedAt,
@@ -538,11 +621,11 @@ export class ClaudeCodeAdapter extends AgentAdapter {
   }
 
   async writeSession(session: Session, projectPath?: string): Promise<string> {
-    // 确定 session_id（必须是 UUIDv4）
-    let sessionId = session.sessionId;
-    if (!isUuidV4(sessionId)) {
-      sessionId = uuidV4();
-    }
+    // 确定 session_id（必须是 UUIDv4）：已是 v4 则沿用，否则确定性派生——
+    // 随机生成会让重复迁移产生 id 不同、内容相同的重复会话。
+    const sessionId = isUuidV4(session.sessionId)
+      ? session.sessionId
+      : deriveTargetSessionId(this.platform, session.sessionId);
 
     // 确定目标目录
     const cwd = projectPath ?? session.cwd;
@@ -678,6 +761,20 @@ export class ClaudeCodeAdapter extends AgentAdapter {
       leafUuid: lastUserUuid ?? parentUuid,
       sessionId,
     });
+
+    // 4. summary 行（标题）
+    // Claude Code 的 /resume 列表靠 type:"summary" 记录显示会话标题，
+    // 缺失时退回显示 session id 前缀（如 824ff784），迁移来的会话全中招。
+    // 源适配器读出的 title 已经过注入清洗，这里直接落盘。
+    const summary = cleanTitleText(session.title ?? '') || fallbackTitle(sessionId);
+    if (summary) {
+      records.push({
+        type: 'summary',
+        summary,
+        leafUuid: parentUuid,
+        sessionId,
+      });
+    }
 
     return records;
   }
